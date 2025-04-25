@@ -8,7 +8,10 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"sort"
 )
+
+var N_REDUCE int = -1
 
 type KeyValue struct {
 	Key   string
@@ -24,6 +27,7 @@ func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 var status Status = IDLE
+var prevTask *TaskReply = nil
 
 // Map functions return a slice of KeyValue.
 
@@ -36,6 +40,10 @@ func ihash(key string) int {
 }
 
 func DoMap(mid int, inputPath string, mapf func(string, string) []KeyValue) error {
+	if mid < 0 {
+		panic("输入不能小于 0")
+	}
+
 	intermediate := []KeyValue{}
 	file, err := os.Open(inputPath)
 	if err != nil {
@@ -52,7 +60,7 @@ func DoMap(mid int, inputPath string, mapf func(string, string) []KeyValue) erro
 	var intermediateFiles []*os.File
 	var encoders []*json.Encoder
 	// create N_REDUCE intermediate file handlers
-	for rid := 0; rid < N_REDUCE; rid++ {
+	for rid := range N_REDUCE {
 		fileName := fmt.Sprintf("tmp-intermediate-%d-%d.json", mid, rid)
 		file, err := os.Create(fileName)
 		if err != nil {
@@ -66,7 +74,6 @@ func DoMap(mid int, inputPath string, mapf func(string, string) []KeyValue) erro
 	for _, item := range intermediate {
 		k := item.Key
 		rid := ihash(k) % N_REDUCE
-		fmt.Println("hashed rid: ", rid)
 		encoders[rid].Encode(item)
 	}
 
@@ -77,27 +84,33 @@ func DoMap(mid int, inputPath string, mapf func(string, string) []KeyValue) erro
 }
 
 func DoReduce(rid int, reducef func(string, []string) string) error {
+	if rid < 0 {
+		panic("输入不能小于 0")
+	}
 	var intermediate []KeyValue
-	for i := 0; i < N_REDUCE; i++ {
-		fileName := fmt.Sprintf("tmp-intermediate-%d-%d.json", i, rid)
-		file, err := os.Create(fileName)
+	mid := 0
+	for {
+		fileName := fmt.Sprintf("tmp-intermediate-%d-%d.json", mid, rid)
+		file, err := os.Open(fileName)
 		if err != nil {
-			return err
+			fmt.Println(err)
+			break
 		}
 		dec := json.NewDecoder(file)
 		for {
 			var kv KeyValue
 			if err := dec.Decode(&kv); err != nil {
-			  break
+				break
 			}
 			intermediate = append(intermediate, kv)
 		}
+		mid ++
 	}
-
+	sort.Sort(ByKey(intermediate))
 
 	oname := fmt.Sprintf("mr-out-%d", rid)
 	ofile, _ := os.Create(oname)
-	
+
 	i := 0
 	for i < len(intermediate) {
 		j := i + 1
@@ -109,7 +122,6 @@ func DoReduce(rid int, reducef func(string, []string) string) error {
 			values = append(values, intermediate[k].Value)
 		}
 		output := reducef(intermediate[i].Key, values)
-
 		// this is the correct format for each line of Reduce output.
 		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
 
@@ -123,30 +135,30 @@ func DoReduce(rid int, reducef func(string, []string) string) error {
 // main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
-	reply := CallExample()
-	fmt.Println("Receiving a %s task", reply.TaskType)
-	if reply.TaskType == MAP {
-		DoMap(reply.TaskId, reply.MapInputFile, mapf)
-	} else if reply.TaskType == REDUCE {
-		DoReduce(reply.TaskId, reducef)
+	for {
+		reply := Apply()
+		fmt.Println("Receiving a task:", reply)
+		if reply.TaskType == MAP {
+			DoMap(reply.TaskId, reply.MapInputFile, mapf)
+		} else if reply.TaskType == REDUCE {
+			DoReduce(reply.TaskId, reducef)
+		}
+		Done()
 	}
+
 }
 
 // example function to show how to make an RPC call to the coordinator.
 //
 // the RPC argument and reply types are defined in rpc.go.
-func CallExample() TaskReply {
+func Apply() TaskReply {
 
 	// declare an argument structure.
 	args := TaskRequest{
 		CurrentStatus: IDLE,
 	}
 
-	// fill in the argument(s).
-
-	// declare a reply structure.
 	reply := TaskReply{
-		TaskId:       -1,
 		TaskType:     MAP,
 		MapInputFile: "",
 	}
@@ -156,8 +168,35 @@ func CallExample() TaskReply {
 	// receiving server that we'd like to call
 	// the Example() method of struct Coordinator.
 	ok := call("Coordinator.Example", &args, &reply)
+	prevTask = &reply
 	if ok {
-		// reply.Y should be 100.
+		N_REDUCE = reply.NReduce
+	} else {
+		fmt.Printf("call failed!\n")
+	}
+	return reply
+}
+
+// example function to show how to make an RPC call to the coordinator.
+//
+// the RPC argument and reply types are defined in rpc.go.
+func Done() TaskReply {
+	// declare an argument structure.
+	args := TaskRequest{}
+	if prevTask.TaskType == MAP {
+		args.CurrentStatus = DONE_MAPPING
+	} else {
+		args.CurrentStatus = DONE_REDUCING
+	}
+	args.PrevTask = prevTask
+	// fill in the argument(s).
+
+	// declare a reply structure.
+	reply := TaskReply{
+	}
+	ok := call("Coordinator.Example", &args, &reply)
+	if ok {
+		fmt.Println("Task Done:", prevTask)
 	} else {
 		fmt.Printf("call failed!\n")
 	}
