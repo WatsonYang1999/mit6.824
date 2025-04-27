@@ -9,6 +9,7 @@ import (
 	"net/rpc"
 	"os"
 	"sort"
+	"time"
 )
 
 var N_REDUCE int = -1
@@ -80,6 +81,16 @@ func DoMap(mid int, inputPath string, mapf func(string, string) []KeyValue) erro
 	for _, fileHandler := range intermediateFiles {
 		fileHandler.Close()
 	}
+	for rid := range N_REDUCE {
+		oldName := fmt.Sprintf("tmp-intermediate-%d-%d.json", mid, rid)
+		newName := fmt.Sprintf("intermediate-%d-%d.json", mid, rid)
+	
+		err := os.Rename(oldName, newName)
+		if err != nil {
+			return fmt.Errorf("failed to rename file %s to %s: %v", oldName, newName, err)
+		}
+	}
+
 	return nil
 }
 
@@ -90,9 +101,12 @@ func DoReduce(rid int, reducef func(string, []string) string) error {
 	var intermediate []KeyValue
 	mid := 0
 	for {
-		fileName := fmt.Sprintf("tmp-intermediate-%d-%d.json", mid, rid)
+		fileName := fmt.Sprintf("intermediate-%d-%d.json", mid, rid)
 		file, err := os.Open(fileName)
 		if err != nil {
+			if mid < 8 {
+				panic("some intermediate files are missing! : " + fileName)
+			}
 			fmt.Println(err)
 			break
 		}
@@ -142,6 +156,9 @@ func Worker(mapf func(string, string) []KeyValue,
 			DoMap(reply.TaskId, reply.MapInputFile, mapf)
 		} else if reply.TaskType == REDUCE {
 			DoReduce(reply.TaskId, reducef)
+		} else {
+			time.Sleep(time.Duration(500 * time.Millisecond))
+			continue
 		}
 		Done()
 	}
@@ -172,7 +189,8 @@ func Apply() TaskReply {
 	if ok {
 		N_REDUCE = reply.NReduce
 	} else {
-		fmt.Printf("call failed!\n")
+		fmt.Println("call failed:", ok)
+		reply.TaskType = NONE
 	}
 	return reply
 }

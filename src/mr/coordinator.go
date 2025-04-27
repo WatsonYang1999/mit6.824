@@ -1,6 +1,7 @@
 package mr
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -39,9 +40,11 @@ type Coordinator struct {
 }
 
 func getUndoneTask(taskMap map[int]*TaskInfo) *TaskInfo {
+	mu.Lock()
+	defer mu.Unlock()
 	var nextTask *TaskInfo
 	for _, task := range taskMap {
-		if !task.done && task.beginTime == 0 {
+		if !task.done && (task.beginTime == 0 || time_t(time.Now().Unix())-task.beginTime > 20) {
 			nextTask = task
 			break
 		}
@@ -53,7 +56,56 @@ func getUndoneTask(taskMap map[int]*TaskInfo) *TaskInfo {
 	return nextTask
 }
 
+func (c *Coordinator) CheckAllMapDone() bool {
+	mu.Lock()
+	defer mu.Unlock()
+	for _, task := range c.mapTaskMap {
+		fmt.Println("[Coordinator] Task Map", task)
+	}
+	for _, task := range c.reduceTaskMap {
+		fmt.Println("[Coordinator] Reduce Map", task)
+	}
+	for _, task := range c.mapTaskMap {
+		if !task.done {
+			return false
+		}
+	}
+	return true
+}
+
+func fileExists(filename string) bool {
+	// 使用 os.Stat 获取文件信息
+	fmt.Println("[Coordinator] Looking for :", filename)
+	_, err := os.Stat(filename)
+	// 如果文件存在，不返回错误
+	if err == nil {
+		fmt.Println("[Coordinator] Found :", filename)
+		return true
+	}
+	// 如果文件不存在，返回错误信息
+	if os.IsNotExist(err) {
+		return false
+	}
+	// 其他错误情况，返回 false
+	return false
+}
+
+func (c *Coordinator) CheckAllIntermediate() bool {
+	for _, i := range c.mapTaskMap {
+		for j := range c.nReduce {
+			intermediate := fmt.Sprintf("intermediate-%d-%d.json", i.taskId, j)
+			if !fileExists(intermediate) {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
 func (c *Coordinator) CheckAllJobDone() bool {
+	mu.Lock()
+	defer mu.Unlock()
 	for _, task := range c.mapTaskMap {
 		if !task.done {
 			return false
@@ -68,57 +120,61 @@ func (c *Coordinator) CheckAllJobDone() bool {
 }
 
 func (c *Coordinator) UpdateJob(taskType TaskType, taskId int) {
+	mu.Lock()
+	defer mu.Unlock()
 	if taskType == MAP {
-		c.reduceTaskMap[taskId].done = true
-		return
-	} else if taskType == REDUCE {
 		c.mapTaskMap[taskId].done = true
-		return
+
+	} else if taskType == REDUCE {
+		c.reduceTaskMap[taskId].done = true
+
+	} else {
+		panic("[Coordinator]  Invalid Task")
 	}
-	panic("Invalid Task")
+	for _, task := range c.mapTaskMap {
+		fmt.Println("Task Map", task)
+	}
+	for _, task := range c.reduceTaskMap {
+		fmt.Println("Task Reduce", task)
+	}
 }
 
 func (c *Coordinator) GetNextMapTask() *TaskInfo {
-
 	nextMapTask := getUndoneTask(c.mapTaskMap)
 	if nextMapTask != nil {
 		return nextMapTask
 	} else {
-		return getUndoneTask(c.reduceTaskMap)
+		if c.CheckAllMapDone() {
+			return getUndoneTask(c.reduceTaskMap)
+		}
 	}
+	return nil
 }
 
-// Your code here -- RPC handlers for the worker to call.
-
-// an example RPC handler.
-//
-// the RPC argument and reply types are defined in rpc.go.
 func (c *Coordinator) Example(request *TaskRequest, reply *TaskReply) error {
-	mu.Lock()
+	fmt.Println("[Coordinator] Receiving Request:", request)
 	if request.CurrentStatus == DONE_MAPPING {
-		prevTaskId := request.PrevTask.TaskId
-		c.mapTaskMap[prevTaskId].done = true
-		for _, task := range c.mapTaskMap {
-			fmt.Println("Task Map", task)
-		}
+		c.UpdateJob(MAP, request.PrevTask.TaskId)
 	} else if request.CurrentStatus == DONE_REDUCING {
-		c.reduceTaskMap[request.PrevTask.TaskId].done = true
-		for _, task := range c.reduceTaskMap {
-			fmt.Println("Task Map", task)
-		}
+		c.UpdateJob(REDUCE, request.PrevTask.TaskId)
 	} else { // for new assigned task
 		// update taskMap
 		nextMapTask := c.GetNextMapTask()
-
+		fmt.Println("Get Next Job is:", nextMapTask)
 		if nextMapTask != nil { // assign map task first
 			reply.NReduce = c.nReduce
 			reply.TaskType = nextMapTask.taskType
 			reply.MapInputFile = nextMapTask.taskInputFile
 			reply.TaskId = nextMapTask.taskId
+		} else {
+			if(c.CheckAllJobDone()) {
+				fmt.Println("[Coordinator] All Jobs Are Done", reply)
+				return nil
+			}
+			return errors.New("[Coordinator]  Gotta Wait All Map is Done to Begin Reduce")
 		}
 	}
-	mu.Unlock()
-	fmt.Println("Returning Reply:", reply)
+	fmt.Println("[Coordinator] Returning Reply:", reply)
 	return nil
 }
 
