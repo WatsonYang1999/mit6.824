@@ -32,6 +32,7 @@ func MakeClerk(clnt *tester.Clnt, servers []string) kvtest.IKVClerk {
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 
 	// You will have to modify this function.
+	ok := ck.clnt.Call(ck.servers[i], "KVServer.Get", &args, &reply)
 	return "", 0, ""
 }
 
