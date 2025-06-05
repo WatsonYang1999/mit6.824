@@ -9,7 +9,10 @@ package raft
 import (
 	//	"bytes"
 	"fmt"
+	"log"
 	"math/rand"
+	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,6 +23,13 @@ import (
 	tester "6.5840/tester1"
 )
 
+const (
+	DEBUG = iota
+	INFO
+	WARNING
+	ERROR
+)
+
 type Role string
 
 const (
@@ -28,7 +38,7 @@ const (
 	FOLLOWER  = "Follower"
 )
 
-const HeartBeatInterval = 100
+const HeartBeatInterval = 10
 
 const ElectionTimeout = 200
 
@@ -40,6 +50,9 @@ type LogEntry struct {
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
+	logLevel int // 当前日志等级
+	logger   *log.Logger
+
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *tester.Persister   // Object to hold this peer's persisted state
@@ -67,6 +80,33 @@ type Raft struct {
 	matchIndexMap map[int]int //for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
 }
 
+func (rf *Raft) Log(level int, msg string, args ...interface{}) {
+	if level < rf.logLevel {
+		return
+	}
+
+	// 获取调用的函数名
+	pc, _, _, ok := runtime.Caller(1)
+	funcName := "unknown"
+	if ok {
+		fullFuncName := runtime.FuncForPC(pc).Name()
+		lastSlash := 0
+		for i := len(fullFuncName) - 1; i >= 0; i-- {
+			if fullFuncName[i] == '/' || fullFuncName[i] == '.' {
+				lastSlash = i
+				break
+			}
+		}
+		funcName = fullFuncName[lastSlash+1:]
+	}
+
+	// 构造日志前缀
+	prefix := fmt.Sprintf("[%s] [Node %d] [%s] ", time.Now().Format("2006-01-02 15:04:05.000"), rf.me, funcName)
+
+	// 输出日志
+	rf.logger.Printf(prefix+msg, args...)
+}
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -76,7 +116,7 @@ func (rf *Raft) GetState() (int, bool) {
 	// Your code here (3A).
 	term = rf.currentTerm
 	isleader = (rf.currentRole == LEADER)
-	fmt.Println("Node: ", rf.me, " Current Role:", rf.currentRole, "Current Term ", rf.currentTerm)
+	rf.Log(INFO, " Current Role: %s Current Term : %d", rf.currentRole, rf.currentTerm)
 	return term, isleader
 }
 
@@ -169,33 +209,68 @@ func (rf *Raft) SwitchRole(nextRole Role) {
 	if rf.currentRole == nextRole {
 		return
 	}
-	fmt.Printf("[Node %d][Switch Role] from %s to %s \n", rf.me, rf.currentRole, nextRole)
+	rf.Log(INFO, "from %s to %s \n", rf.currentRole, nextRole)
 	rf.currentRole = nextRole
 }
 
+// AppendEntries handles incoming AppendEntries RPCs from the leader.
+// Arguments:
+//
+//	args  - Contains details of the AppendEntries RPC:
+//	  - Term: The leader's term.
+//	  - LeaderId: The leader's ID (for redirecting clients).
+//	  - PrevLogIndex: Index of the log entry immediately preceding new ones.
+//	  - PrevLogTerm: Term of the log entry at PrevLogIndex.
+//	  - Entries[]: Log entries to store (empty for heartbeat).
+//	               May send more than one for efficiency.
+//	  - LeaderCommit: Leader's commitIndex.
+//	reply - The reply structure for the RPC:
+//	  - Term: The current term of the follower (for the leader to update itself).
+//	  - Success: True if the follower contained an entry matching
+//	             PrevLogIndex and PrevLogTerm.
+//
+// Results:
+//  1. Reply false if Term < currentTerm (§5.1).
+//  2. Reply false if the log doesn’t contain an entry at PrevLogIndex
+//     whose term matches PrevLogTerm (§5.3).
+//  3. If an existing entry conflicts with a new one (same index but different terms),
+//     delete the existing entry and all that follow it (§5.3).
+//  4. Append any new entries not already in the log.
+//  5. If LeaderCommit > commitIndex, set commitIndex =
+//     min(LeaderCommit, index of the last new entry).
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// now all log entries is empty heartbeat from leader
-
-	emptyLog := args.Entries[0]
-	fmt.Println("[Node ", rf.me, "] [AppendEntries]  Current Node is ", rf.me, "Receiving append entries args:", args)
+	if rf.currentTerm > args.Term {
+		return
+	}
+	rf.Log(INFO, "Args: %v", args)
 	rf.lastHeartbeatTime = time.Now()
 	// 这里暂时没考虑多个leader，需要比较谁的log更新的问题
-	if rf.currentRole != LEADER  || (rf.currentRole == LEADER && args.PrevLogTerm > rf.currentTerm){
-		rf.currentTerm = emptyLog.Term
+	if rf.currentRole != LEADER || (rf.currentRole == LEADER && args.Term > rf.currentTerm) {
+		if rf.currentTerm != args.Term {
+			rf.Log(INFO, "Update Term from %d to %d ", rf.currentTerm, args.Term)
+		}
+		{
+			rf.currentTerm = args.Term
+		}
 		rf.SwitchRole(FOLLOWER)
 	}
 }
 
 func (rf *Raft) SendHeartbeat() {
 	// send empty log to all peers
-	emptyLog := &LogEntry{}
-	emptyLog.Term = rf.currentTerm
+	rf.Log(INFO, "Leader Sending HeartBeat to Peers, Current Term is %d", rf.currentTerm)
+	// emptyLog := &LogEntry{}
+	// emptyLog.Term = rf.currentTerm
 
 	appendEntryArgs := &AppendEntriesArgs{}
-	appendEntryArgs.Entries = append(appendEntryArgs.Entries, *emptyLog)
+	appendEntryArgs.Term = rf.currentTerm
+	// appendEntryArgs.PrevLogTerm = emptyLog.Term
+	// appendEntryArgs.PrevLogIndex = emptyLog.Index
+
+	// appendEntryArgs.Entries = append(appendEntryArgs.Entries, *emptyLog)
 	for _, peer := range rf.peers {
 		appendEntriesReply := &AppendEntriesReply{}
-		fmt.Println("Leader Send Heartbeat to:", peer)
 		peer.Call("Raft.AppendEntries", appendEntryArgs, appendEntriesReply)
 	}
 }
@@ -207,8 +282,6 @@ func (rf *Raft) SendHeartbeat() {
 // 2. If votedFor is null or candidateId, and candidate’s log is at
 // least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	argsInfo := fmt.Sprint("        ### RequestVote Args is", args)
-
 	if rf.currentTerm > args.Term {
 		reply.VoteGranted = false
 		return
@@ -218,14 +291,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if (!ok || rf.votedFor[args.Term] == args.CandidateId) && (args.LastLogIndex >= lastLog.Index) {
 		reply.VoteGranted = true
 		reply.Term = rf.currentTerm
-		if rf.votedFor[args.Term] != args.CandidateId { 
+		if rf.votedFor[args.Term] != args.CandidateId {
 			rf.lastHeartbeatTime = time.Now()
 		}
 		rf.votedFor[args.Term] = args.CandidateId
-		fmt.Println("Vote Granted from:", rf.me, "To: ", args.CandidateId, argsInfo, "last log is ", lastLog, "Voted for", rf.votedFor)
+		rf.Log(INFO, "[vote for term %d] Vote Granted from: %d To: %d , RequestVote Args is %v Voted for %v", args.Term, rf.me, args.CandidateId, args, rf.votedFor)
 		return
 	}
-	fmt.Println("Vote Denied from:", rf.me, "To: ", args.CandidateId, argsInfo, "last log is ", lastLog, "Voted for", rf.votedFor)
+	rf.Log(INFO, "[vote for term %d] Vote Denied from: %d To: %d , RequestVote Args is %v  Voted for %v", args.Term, rf.me, args.CandidateId, args, rf.votedFor)
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -301,29 +374,28 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf * Raft) checkElectionTimeout() bool {
+func (rf *Raft) checkElectionTimeout() bool {
 	currentTime := time.Now()
 	elapsed := currentTime.Sub(rf.lastHeartbeatTime)
-	return elapsed > ElectionTimeout * time.Millisecond
+	return elapsed > ElectionTimeout*time.Millisecond
 }
 
-func (rf * Raft) startNewElection() {
+func (rf *Raft) startNewElection() {
 	rf.SwitchRole(CANDIDATE)
+
 	rf.currentTerm++
 	rf.votedFor[rf.currentTerm] = rf.me
-	fmt.Printf("[Node %d] Start Election for term %d", rf.me, rf.currentTerm)
+	rf.Log(INFO, "Start Election for term %d", rf.currentTerm)
 }
-
-
 
 func (rf *Raft) ticker() {
 	for !rf.killed() {
-
 		// Your code here (3A)
 		// Check if a leader election should be started.
 		if rf.currentRole == LEADER {
-			fmt.Printf("[Node %d] Leader Sending HeartBeat to Peers", rf.me)
-			rf.SendHeartbeat()
+			{
+				rf.SendHeartbeat()
+			}
 
 			time.Sleep(time.Duration(HeartBeatInterval) * time.Millisecond)
 		} else if rf.currentRole == CANDIDATE {
@@ -344,25 +416,26 @@ func (rf *Raft) ticker() {
 					voteCount += 1
 				}
 			}
+			rf.Log(INFO, "Finish one round of request vote: %d votes received", voteCount)
 			// ToDo: one tricky case is request vote continue after reset to follower
 			if voteCount > len(rf.peers)/2 {
 				rf.SwitchRole(LEADER)
 				continue
 			}
 
-			ms := HeartBeatInterval + (rand.Int63() % ElectionTimeout)
-			time.Sleep(time.Duration(ms) * time.Millisecond)
-
 			if rf.checkElectionTimeout() {
+
+				ms := HeartBeatInterval + (rand.Int63() % ElectionTimeout)
+				time.Sleep(time.Duration(ms) * time.Millisecond)
 				rf.startNewElection()
 			}
 		} else {
 			// pause for a random amount of time between 50 and 350
 			// milliseconds.
-			ms := HeartBeatInterval + (rand.Int63() % ElectionTimeout)
-			time.Sleep(time.Duration(ms) * time.Millisecond)
 
 			if rf.checkElectionTimeout() {
+				ms := HeartBeatInterval + (rand.Int63() % ElectionTimeout)
+				time.Sleep(time.Duration(ms) * time.Millisecond)
 				rf.startNewElection()
 			}
 		}
@@ -395,6 +468,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentRole = FOLLOWER
 	rf.currentTerm = 0
 	rf.votedFor = make(map[int]int)
+	rf.logger = log.New(os.Stdout, "", 0) // 自定义日志前缀后缀
+	rf.logLevel = DEBUG
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	ms := 50 + (rand.Int63() % 300)
